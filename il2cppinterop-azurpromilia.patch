@@ -1,0 +1,2026 @@
+diff --git a/Il2CppInterop.Runtime/IL2CPP.cs b/Il2CppInterop.Runtime/IL2CPP.cs
+index 0cb5aca..585ac3e 100644
+--- a/Il2CppInterop.Runtime/IL2CPP.cs
++++ b/Il2CppInterop.Runtime/IL2CPP.cs
+@@ -737,9 +737,57 @@ public static unsafe class IL2CPP
+     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+     public static IntPtr il2cpp_method_get_from_reflection(IntPtr method)
+     {
+-        if (UnityVersionHandler.HasGetMethodFromReflection) return _il2cpp_method_get_from_reflection(method);
++        if (UnityVersionHandler.HasGetMethodFromReflection) return DiagFromReflection(method, _il2cpp_method_get_from_reflection(method));
+         Il2CppReflectionMethod* reflectionMethod = (Il2CppReflectionMethod*)method;
+-        return (IntPtr)reflectionMethod->method;
++        return DiagFromReflection(method, (IntPtr)reflectionMethod->method);
++    }
++
++    private static int s_FromReflectionCalls;
++
++    private static IntPtr DiagFromReflection(IntPtr reflectionMethod, IntPtr result)
++    {
++        var count = System.Threading.Interlocked.Increment(ref s_FromReflectionCalls);
++        if (count > 64) return result;
++
++        try
++        {
++            var builder = new StringBuilder();
++            builder.Append("[diag] method_get_from_reflection #").Append(count)
++                .Append(" reflection=0x").Append(reflectionMethod.ToString("X"))
++                .Append(" -> method=0x").Append(result.ToString("X"))
++                .Append(" hasExport=").Append(UnityVersionHandler.HasGetMethodFromReflection);
++
++            if (result != IntPtr.Zero)
++            {
++                try
++                {
++                    builder.Append(" inflated=").Append(il2cpp_method_is_inflated(result))
++                        .Append(" generic=").Append(il2cpp_method_is_generic(result))
++                        .Append(" name=").Append(il2cpp_method_get_name_(result));
++
++                    // methodPointer / virtualMethodPointer / invoker_method come first; a null
++                    // methodPointer on an inflated method means the generic instantiation was
++                    // never code-generated, and invoking it jumps into nothing.
++                    var words = (ulong*)result;
++                    builder.AppendLine();
++                    for (var i = 0; i < 8; i++)
++                        builder.Append("    mi+0x").Append((i * 8).ToString("X2")).Append(" = 0x")
++                            .Append(words[i].ToString("X16")).AppendLine();
++                }
++                catch (Exception ex)
++                {
++                    builder.Append(" <probe failed: ").Append(ex.Message).Append('>');
++                }
++            }
++
++            Logger.Instance.LogInformation("{Diagnostic}", builder.ToString());
++        }
++        catch
++        {
++            // Diagnostics must never change control flow.
++        }
++
++        return result;
+     }
+ 
+     [DllImport("GameAssembly", EntryPoint = nameof(il2cpp_method_get_from_reflection), CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+@@ -864,8 +912,93 @@ public static unsafe class IL2CPP
+     [return: MarshalAs(UnmanagedType.I1)]
+     public static extern bool il2cpp_monitor_try_wait(IntPtr obj, uint timeout);
+ 
+-    [DllImport("GameAssembly", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+-    public static extern IntPtr il2cpp_runtime_invoke(IntPtr method, IntPtr obj, void** param, ref IntPtr exc);
++    // The generated interop assemblies bind to this member, so routing the raw export through a
++    // managed shim lets us observe calls that arrive with a null method pointer. Without this the
++    // only symptom is Unity printing "The script 'X' could not be instantiated!" from AddComponent,
++    // with nothing on the managed side to point at.
++    public static IntPtr il2cpp_runtime_invoke(IntPtr method, IntPtr obj, void** param, ref IntPtr exc)
++    {
++        if (method == IntPtr.Zero) DiagNullMethodInvoke(obj);
++        var traced = DiagEnterInvoke(method, obj);
++
++        var result = _il2cpp_runtime_invoke(method, obj, param, ref exc);
++
++        if (traced) DiagExitInvoke(result);
++        return result;
++    }
++
++    private static int s_TracedInvokes;
++
++    /// <summary>
++    /// A call that never returns leaves no trace otherwise, so every invoke is bracketed with an
++    /// enter/exit pair until the budget runs out. The last unmatched "enter" names the culprit.
++    /// </summary>
++    private static bool DiagEnterInvoke(IntPtr method, IntPtr obj)
++    {
++        var count = System.Threading.Interlocked.Increment(ref s_TracedInvokes);
++        if (count > 200) return false;
++
++        try
++        {
++            string name;
++            try
++            {
++                var declaringType = method == IntPtr.Zero ? IntPtr.Zero : il2cpp_method_get_declaring_type(method);
++                var typeName = declaringType == IntPtr.Zero ? "?" : il2cpp_class_get_name_(declaringType);
++                var methodName = method == IntPtr.Zero ? "?" : il2cpp_method_get_name_(method);
++                name = $"{typeName}::{methodName}";
++            }
++            catch
++            {
++                name = "?";
++            }
++
++            Logger.Instance.LogInformation("[invoke] > #{Count} {Name} method=0x{Method:X} obj=0x{Obj:X}",
++                count, name, (long)method, (long)obj);
++        }
++        catch
++        {
++            // Diagnostics must never change control flow.
++        }
++
++        return true;
++    }
++
++    private static void DiagExitInvoke(IntPtr result)
++    {
++        try
++        {
++            Logger.Instance.LogInformation("[invoke] < returned 0x{Result:X}", (long)result);
++        }
++        catch
++        {
++            // Diagnostics must never change control flow.
++        }
++    }
++
++    private static int s_NullMethodInvokes;
++
++    private static void DiagNullMethodInvoke(IntPtr obj)
++    {
++        var count = System.Threading.Interlocked.Increment(ref s_NullMethodInvokes);
++        if (count > 8) return;
++
++        try
++        {
++            var builder = new StringBuilder();
++            builder.Append("[diag] il2cpp_runtime_invoke(method=NULL) #").Append(count)
++                .Append(" obj=0x").Append(obj.ToString("X")).AppendLine();
++            builder.Append(new System.Diagnostics.StackTrace(true));
++            Logger.Instance.LogError("{Diagnostic}", builder.ToString());
++        }
++        catch
++        {
++            // Diagnostics must never change control flow.
++        }
++    }
++
++    [DllImport("GameAssembly", EntryPoint = nameof(il2cpp_runtime_invoke), CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
++    private static extern IntPtr _il2cpp_runtime_invoke(IntPtr method, IntPtr obj, void** param, ref IntPtr exc);
+ 
+     [DllImport("GameAssembly", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+     // param can be of Il2CppObject*
+diff --git a/Il2CppInterop.Runtime/Injection/ClassInjector.cs b/Il2CppInterop.Runtime/Injection/ClassInjector.cs
+index b9fb648..8ff9efa 100644
+--- a/Il2CppInterop.Runtime/Injection/ClassInjector.cs
++++ b/Il2CppInterop.Runtime/Injection/ClassInjector.cs
+@@ -523,10 +523,134 @@ public static unsafe partial class ClassInjector
+ 
+         InjectorHelpers.AddTypeToLookup(type, classPointer.Pointer);
+ 
++        // Diagnostic: an injected type that registers but cannot be instantiated by
++        // GameObject.AddComponent leaves no trace otherwise. Dump the raw Il2CppClass so the
++        // shape can be compared against the base type (which is known good).
++        try
++        {
++            Logger.Instance.LogInformation(
++                "[inject] {Type}: klass=0x{Klass:X} name={Name} parent={Parent} parentKlass=0x{ParentKlass:X}" +
++                " instanceSize={Size} parentSize={ParentSize} actualSize={ActualSize} nativeSize={NativeSize}" +
++                " vtable={Vtable} parentVtable={ParentVtable} fieldCount={Fields} hierarchyDepth={Depth}" +
++                " flags=0x{Flags:X} initialized={Initialized} sizeInited={SizeInited} vtableInited={VtableInited}" +
++                " byvalType={ByValType} byvalData=0x{ByValData:X}",
++                type,
++                (long)classPointer.ClassPointer,
++                Marshal.PtrToStringUTF8(classPointer.Name),
++                Marshal.PtrToStringUTF8(baseClassPointer.Name),
++                (long)baseClassPointer.ClassPointer,
++                classPointer.InstanceSize,
++                baseClassPointer.InstanceSize,
++                classPointer.ActualSize,
++                classPointer.NativeSize,
++                classPointer.VtableCount,
++                baseClassPointer.VtableCount,
++                classPointer.FieldCount,
++                classPointer.TypeHierarchyDepth,
++                classPointer.Flags,
++                classPointer.Initialized,
++                classPointer.SizeInited,
++                classPointer.IsVtableInitialized,
++                classPointer.ByValArg.Type,
++                (long)classPointer.ByValArg.Data);
++
++            foreach (var ctor in type.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
++            {
++                var parameters = ctor.GetParameters();
++                Logger.Instance.LogInformation("[inject] {Type} ctor({Params}) isPublic={Public}",
++                    type, string.Join(", ", parameters.Select(p => p.ParameterType.Name)), ctor.IsPublic);
++            }
++
++            // Unity's AddComponent needs to resolve a parameterless .ctor on the class it is handed,
++            // and it allocates through il2cpp. Probing both here separates "class shape is wrong"
++            // from "the caller never reached us".
++            var emptyCtor = IL2CPP.il2cpp_class_get_method_from_name(classPointer.Pointer, ".ctor", 0);
++            Logger.Instance.LogInformation("[inject] {Type} GetMethodFromName(.ctor,0) -> 0x{Method:X}",
++                type, (long)emptyCtor);
++
++            var probe = IL2CPP.il2cpp_object_new(classPointer.Pointer);
++            var probeClass = probe == IntPtr.Zero ? IntPtr.Zero : IL2CPP.il2cpp_object_get_class(probe);
++            Logger.Instance.LogInformation("[inject] {Type} il2cpp_object_new -> 0x{Object:X} class=0x{Class:X}",
++                type, (long)probe, (long)probeClass);
++
++            // Object::New rejects a class when [klass->image->assembly + 0x60] != 0 and raises an
++            // ExecutionEngineException instead of allocating. Dumping the image/assembly chain of
++            // the injected class next to a real one (MonoBehaviour) shows which word is wrong.
++            if (type.Name == "UniversalBehaviour")
++            {
++                DumpImageChain(classPointer, "injected");
++                DumpImageChain(baseClassPointer, "reference");
++
++                // UniverseLib walks every loaded assembly through GetTypes() immediately after this
++                // and the CLR aborts part way through on some setups. Probing here reproduces the
++                // same walk while the assembly set is still representative, so the abort names the
++                // assembly that caused it.
++                Runtime.TypeLoadProbe.RunOnce();
++            }
++        }
++        catch (Exception ex)
++        {
++            Logger.Instance.LogWarning("[inject] diagnostic dump failed: {Message}", ex.Message);
++        }
++
+         if (options.LogSuccess)
+             Logger.Instance.LogInformation("Registered mono type {Type} in il2cpp domain", type);
+     }
+ 
++    private static unsafe void DumpImageChain(INativeClassStruct klass, string label)
++    {
++        var builder = new StringBuilder();
++        var klassPointer = (byte*)klass.ClassPointer;
++        var image = *(IntPtr*)klassPointer; // Il2CppClass.image, offset 0x00
++        builder.Append("[dump] ").Append(label)
++            .Append(" klass=0x").Append(((long)klassPointer).ToString("X"))
++            .Append(" image=0x").Append(image.ToString("X"));
++
++        if (image == IntPtr.Zero)
++        {
++            Logger.Instance.LogInformation("{Dump}", builder.ToString());
++            return;
++        }
++
++        var imagePointer = (byte*)image;
++        var assembly = *(IntPtr*)(imagePointer + 0x10); // Il2CppImage.assembly
++        builder.Append(" name=0x").Append((*(IntPtr*)imagePointer).ToString("X"))
++            .Append(" assembly=0x").Append(assembly.ToString("X"));
++
++        if (assembly != IntPtr.Zero)
++        {
++            var assemblyPointer = (byte*)assembly;
++            builder.AppendLine();
++            builder.Append("    assembly.image=0x").Append((*(IntPtr*)assemblyPointer).ToString("X"))
++                .Append(" token=0x").Append((*(uint*)(assemblyPointer + 0x08)).ToString("X"))
++                .Append(" refStart=").Append(*(int*)(assemblyPointer + 0x0C))
++                .Append(" refCount=").Append(*(int*)(assemblyPointer + 0x10));
++
++            for (var offset = 0x50; offset <= 0x78; offset += 8)
++                builder.AppendLine()
++                    .Append("    +0x").Append(offset.ToString("X")).Append(" = 0x")
++                    .Append((*(ulong*)(assemblyPointer + offset)).ToString("X16"));
++        }
++
++        Logger.Instance.LogInformation("{Dump}", builder.ToString());
++    }
++
++    private static unsafe string Describe(IntPtr exception)
++    {
++        if (exception == IntPtr.Zero) return "<none>";
++
++        try
++        {
++            var buffer = stackalloc byte[1024];
++            IL2CPP.il2cpp_format_exception(exception, buffer, 1024);
++            return System.Text.Encoding.UTF8.GetString(buffer, 1024).TrimEnd('\0');
++        }
++        catch
++        {
++            return $"0x{exception:X}";
++        }
++    }
++
+     private static bool IsTypeSupported(Type type)
+     {
+         if (type.IsValueType ||
+@@ -798,6 +922,12 @@ public static unsafe partial class ClassInjector
+     public static void Finalize(IntPtr ptr)
+     {
+         var gcHandle = ClassInjectorBase.GetGcHandlePtrFromIl2CppObject(ptr);
++
++        // An instance allocated straight through il2cpp_object_new (no managed wrapper, no
++        // InjectedClassData) has a zero handle. Freeing that would throw on the finalizer thread,
++        // which is fatal, so treat it as "nothing to release".
++        if (gcHandle == IntPtr.Zero) return;
++
+         GCHandle.FromIntPtr(gcHandle).Free();
+     }
+ 
+diff --git a/Il2CppInterop.Runtime/Injection/Hook.cs b/Il2CppInterop.Runtime/Injection/Hook.cs
+index 24bb7bd..c1119d7 100644
+--- a/Il2CppInterop.Runtime/Injection/Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hook.cs
+@@ -35,7 +35,7 @@ namespace Il2CppInterop.Runtime.Injection
+                 return;
+             }
+ 
+-            Logger.Instance.LogTrace("{MethodName} found: 0x{MethodPtr}", TargetMethodName, methodPtr.ToInt64().ToString("X2"));
++            Logger.Instance.LogInformation("[startup] {MethodName} found: 0x{MethodPtr}", TargetMethodName, methodPtr.ToInt64().ToString("X2"));
+ 
+             _detour = GetDetour();
+             Detour.Apply(methodPtr, _detour, out _original);
+diff --git a/Il2CppInterop.Runtime/Injection/Hooks/Class_FromIl2CppType_Hook.cs b/Il2CppInterop.Runtime/Injection/Hooks/Class_FromIl2CppType_Hook.cs
+index bac0354..703b2b1 100644
+--- a/Il2CppInterop.Runtime/Injection/Hooks/Class_FromIl2CppType_Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hooks/Class_FromIl2CppType_Hook.cs
+@@ -25,14 +25,36 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+         internal delegate Il2CppClass* MethodDelegate(Il2CppType* type, bool throwOnError);
+ 
++        private static int s_VerboseHits;
++
+         private Il2CppClass* Hook(Il2CppType* type, bool throwOnError)
+         {
+-            if ((nint)type->data < 0 && (type->type == Il2CppTypeEnum.IL2CPP_TYPE_CLASS || type->type == Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE))
++            InjectorHelpers.LogHookHit(TargetMethodName);
++
++            var verbose = System.Threading.Interlocked.Increment(ref s_VerboseHits) <= 40;
++            var data = (nint)type->data;
++
++            if (data < 0 && (type->type == Il2CppTypeEnum.IL2CPP_TYPE_CLASS || type->type == Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE))
+             {
+-                InjectorHelpers.s_InjectedClasses.TryGetValue((nint)type->data, out var classPointer);
+-                return (Il2CppClass*)classPointer;
++                if (InjectorHelpers.s_InjectedClasses.TryGetValue(data, out var classPointer))
++                {
++                    if (verbose)
++                        Logger.Instance.LogInformation("[fromtype] #{Hit} data=0x{Data:X} type={Type} -> injected 0x{Klass:X}",
++                            s_VerboseHits, (long)data, type->type, classPointer.ToInt64());
++                    return (Il2CppClass*)classPointer;
++                }
++
++                // Falling through to null here is silent and makes AddComponent report
++                // "The script 'X' could not be instantiated!" with no further trace.
++                Logger.Instance.LogWarning("[fromtype] data=0x{Data:X} type={Type} is not a known injected token (known: {Known})",
++                    (long)data, type->type, string.Join(",", InjectorHelpers.s_InjectedClasses.Keys));
++                return null;
+             }
+ 
++            if (verbose)
++                Logger.Instance.LogInformation("[fromtype] #{Hit} data=0x{Data:X} type={Type} -> native",
++                    s_VerboseHits, (long)data, type->type);
++
+             return Original(type, throwOnError);
+         }
+ 
+diff --git a/Il2CppInterop.Runtime/Injection/Hooks/Class_FromName_Hook.cs b/Il2CppInterop.Runtime/Injection/Hooks/Class_FromName_Hook.cs
+index 0c09a48..bf32fcc 100644
+--- a/Il2CppInterop.Runtime/Injection/Hooks/Class_FromName_Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hooks/Class_FromName_Hook.cs
+@@ -16,16 +16,30 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+         internal delegate Il2CppClass* MethodDelegate(Il2CppImage* image, IntPtr _namespace, IntPtr name);
+ 
++        private static int s_VerboseHits;
++
+         private Il2CppClass* Hook(Il2CppImage* image, IntPtr _namespace, IntPtr name)
+         {
++            InjectorHelpers.LogHookHit(TargetMethodName);
+             Il2CppClass* classPtr = Original(image, _namespace, name);
+ 
++            var hit = System.Threading.Interlocked.Increment(ref s_VerboseHits);
++            var verbose = hit <= 80;
++
+             if (classPtr == null)
+             {
+                 string namespaze = Marshal.PtrToStringUTF8(_namespace);
+                 string className = Marshal.PtrToStringUTF8(name);
+                 InjectorHelpers.s_ClassNameLookup.TryGetValue((namespaze, className, (IntPtr)image), out IntPtr injectedClass);
+                 classPtr = (Il2CppClass*)injectedClass;
++                if (verbose)
++                    Logger.Instance.LogInformation("[fromname] #{Hit} {Ns}.{Name} -> native=null injected=0x{Injected:X}",
++                        hit, namespaze, className, injectedClass.ToInt64());
++            }
++            else if (verbose)
++            {
++                Logger.Instance.LogInformation("[fromname] #{Hit} {Ns}.{Name} -> native",
++                    hit, Marshal.PtrToStringUTF8(_namespace), Marshal.PtrToStringUTF8(name));
+             }
+ 
+             return classPtr;
+diff --git a/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs b/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs
+index a0a4258..80f5753 100644
+--- a/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs
+@@ -22,6 +22,7 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+ 
+         private byte* Hook(Il2CppFieldInfo* field, out Il2CppTypeStruct* type)
+         {
++            InjectorHelpers.LogHookHit(TargetMethodName);
+             if (EnumInjector.GetDefaultValueOverride(field, out IntPtr newDefaultPtr))
+             {
+                 INativeFieldInfoStruct wrappedField = UnityVersionHandler.Wrap(field);
+diff --git a/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs b/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs
+index 9fa480b..29182ba 100644
+--- a/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs
+@@ -19,6 +19,7 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+ 
+         private Il2CppMethodInfo* Hook(Il2CppGenericMethod* gmethod, bool copyMethodPtr)
+         {
++            InjectorHelpers.LogHookHit(TargetMethodName);
+             if (gmethod == null || gmethod->methodDefinition == null)
+                 return Original(gmethod, copyMethodPtr);
+ 
+diff --git a/Il2CppInterop.Runtime/Injection/Hooks/MetadataCache_GetTypeInfoFromTypeDefinitionIndex_Hook.cs b/Il2CppInterop.Runtime/Injection/Hooks/MetadataCache_GetTypeInfoFromTypeDefinitionIndex_Hook.cs
+index 943a9ad..4c09253 100644
+--- a/Il2CppInterop.Runtime/Injection/Hooks/MetadataCache_GetTypeInfoFromTypeDefinitionIndex_Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hooks/MetadataCache_GetTypeInfoFromTypeDefinitionIndex_Hook.cs
+@@ -1,6 +1,7 @@
+ ﻿using System;
+ using System.Linq;
+ using System.Runtime.InteropServices;
++using Iced.Intel;
+ using Il2CppInterop.Common;
+ using Il2CppInterop.Common.XrefScans;
+ using Il2CppInterop.Runtime.Runtime;
+@@ -16,11 +17,20 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+         public override MethodDelegate GetDetour() => Hook;
+ 
+         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+-        internal delegate Il2CppClass* MethodDelegate(int index);
++        internal delegate Il2CppClass* MethodDelegate(IntPtr index);
+ 
+-        private Il2CppClass* Hook(int index)
++        private Il2CppClass* Hook(IntPtr index)
+         {
+-            if (InjectorHelpers.s_InjectedClasses.TryGetValue(index, out IntPtr classPtr))
++            InjectorHelpers.LogHookHit(TargetMethodName);
++
++            // The parameter is IntPtr rather than int on purpose. The xref heuristic below can land
++            // on MetadataCache::GetTypeInfoFromHandle instead of GetTypeInfoFromTypeDefinitionIndex;
++            // the former takes a 64-bit metadata handle, so declaring this as `int` truncated it and
++            // the pass-through dereferenced a bogus pointer (seen on Azur Promilia, faulting on
++            // handle & 0xFFFFFFFF + 8). Keeping the register width makes the pass-through lossless
++            // either way; the index-based lookup below still only uses the low 32 bits, which is
++            // exactly what injected class tokens are keyed by.
++            if (InjectorHelpers.s_InjectedClasses.TryGetValue((int)index, out IntPtr classPtr))
+                 return (Il2CppClass*)classPtr;
+ 
+             return Original(index);
+@@ -116,7 +126,66 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+ 
+         public override IntPtr FindTargetMethod()
+         {
+-            return FindGetTypeInfoFromTypeDefinitionIndex();
++            var candidate = FindGetTypeInfoFromTypeDefinitionIndex();
++            var resolved = SkipTailCallWrapper(candidate);
++
++            if (resolved != candidate)
++                Logger.Instance.LogTrace(
++                    "GetTypeInfoFromTypeDefinitionIndex: 0x{From:X} is a tail-call wrapper, using 0x{To:X}",
++                    candidate.ToInt64(), resolved.ToInt64());
++
++            return resolved;
++        }
++
++        /// <summary>
++        /// The xref walk can stop on <c>MetadataCache::GetTypeInfoFromHandle</c>, a thin wrapper that
++        /// converts a 64-bit metadata handle to a definition index and tail-jumps into
++        /// <c>GetTypeInfoFromTypeDefinitionIndex</c>. Hooking the wrapper is wrong twice over: its
++        /// parameter is a pointer where we expect an index, and index-based engine callers bypass it.
++        ///
++        /// A wrapper is recognised structurally - it contains no conditional branch and no return
++        /// before its trailing unconditional jump - so a real lookup function (which always branches
++        /// on the invalid index) is left untouched.
++        /// </summary>
++        private static IntPtr SkipTailCallWrapper(IntPtr candidate)
++        {
++            var moduleStart = InjectorHelpers.Il2CppModule.BaseAddress.ToInt64();
++            var moduleEnd = moduleStart + InjectorHelpers.Il2CppModule.ModuleMemorySize;
++
++            for (var hop = 0; hop < 2; hop++)
++            {
++                var decoder = XrefScanner.DecoderForAddress(candidate);
++                IntPtr tailTarget = IntPtr.Zero;
++                var isRealFunction = false;
++
++                for (var i = 0; i < 40; i++)
++                {
++                    decoder.Decode(out var instruction);
++                    if (decoder.LastError == DecoderError.NoMoreBytes) break;
++                    if (instruction.Mnemonic == Mnemonic.Int3) break;
++
++                    var flow = instruction.FlowControl;
++                    if (flow == FlowControl.Next || flow == FlowControl.Call) continue;
++
++                    if (flow == FlowControl.UnconditionalBranch && !isRealFunction)
++                    {
++                        if (!instruction.IsJmpShort) tailTarget = (IntPtr)instruction.NearBranch64;
++                        break;
++                    }
++
++                    isRealFunction = true;
++                    break;
++                }
++
++                if (isRealFunction || tailTarget == IntPtr.Zero) return candidate;
++
++                var target = tailTarget.ToInt64();
++                if (target < moduleStart || target >= moduleEnd) return candidate;
++
++                candidate = tailTarget;
++            }
++
++            return candidate;
+         }
+     }
+ }
+diff --git a/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs b/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
+index 9bd9b0d..728a59b 100644
+--- a/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
++++ b/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
+@@ -2,6 +2,7 @@
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Diagnostics;
++using System.IO;
+ using System.Linq;
+ using System.Reflection;
+ using System.Reflection.Emit;
+@@ -48,9 +49,27 @@ namespace Il2CppInterop.Runtime.Injection
+             [typeof(double)] = OpCodes.Stind_R8
+         };
+ 
++        /// <summary>
++        /// Unity 2022.2+ widened the prologue of <c>Object::New</c>: before allocating it evaluates
++        /// <c>[klass->image->assembly + 0x60]</c> and raises an <c>ExecutionEngineException</c> when
++        /// that word is non-zero. Unity 2021.3 has no such check, which is why injected classes could
++        /// still be instantiated there. The struct Il2CppInterop allocates for the injected assembly
++        /// stops at 0x58 bytes, so on 2022.2+ that read lands on unrelated heap memory. Give the
++        /// allocation a zeroed tail so the check observes what a real assembly reports.
++        /// </summary>
++        private const int InjectedAssemblyAllocationSize = 0x80;
++
+         private static void CreateInjectedAssembly()
+         {
+-            InjectedAssembly = UnityVersionHandler.NewAssembly();
++            unsafe
++            {
++                var assemblyMemory = Marshal.AllocHGlobal(InjectedAssemblyAllocationSize);
++                for (var i = 0; i < InjectedAssemblyAllocationSize; i++)
++                    ((byte*)assemblyMemory)[i] = 0;
++
++                InjectedAssembly = UnityVersionHandler.Wrap((Il2CppAssembly*)assemblyMemory);
++            }
++
+             InjectedImage = UnityVersionHandler.NewImage();
+ 
+             InjectedAssembly.Name.Name = Marshal.StringToCoTaskMemUTF8("InjectedMonoTypes");
+@@ -70,16 +89,317 @@ namespace Il2CppInterop.Runtime.Injection
+         private static readonly Class_FromName_Hook FromNameHook = new();
+         internal static void Setup()
+         {
+-            if (InjectedAssembly == null) CreateInjectedAssembly();
+-            if (Il2CppInteropRuntime.Instance.UnityVersion.Major >= 6000)
+-                GenericMethodGetMethodHook_Unity6.ApplyHook();
+-            else
+-                GenericMethodGetMethodHook.ApplyHook();
+-            GetTypeInfoFromTypeDefinitionIndexHook.ApplyHook();
+-            GetFieldDefaultValueHook.ApplyHook();
+-            ClassInit ??= FindClassInit();
+-            FromIl2CppTypeHook.ApplyHook();
+-            FromNameHook.ApplyHook();
++            Logger.Instance.LogInformation("[startup] InjectorHelpers.Setup: begin (skips: {Skips})",
++                s_Skips.Count == 0 ? "none" : string.Join(",", s_Skips));
++
++            if (Skip("all"))
++            {
++                Logger.Instance.LogInformation("[startup] Setup skipped entirely via il2cppinterop.skip.txt");
++                return;
++            }
++
++            if (Skip("typedump")) DumpAssemblyTypes();
++            if (s_Skips.Any(token => token.StartsWith("typedump2", StringComparison.OrdinalIgnoreCase)))
++                DumpTypesByToken();
++
++            if (InjectedAssembly == null && !Skip("assembly")) CreateInjectedAssembly();
++            Logger.Instance.LogInformation("[startup] injected assembly/image created");
++
++            if (!SkipHooks("genericmethod"))
++            {
++                if (Il2CppInteropRuntime.Instance.UnityVersion.Major >= 6000)
++                    GenericMethodGetMethodHook_Unity6.ApplyHook();
++                else
++                    GenericMethodGetMethodHook.ApplyHook();
++            }
++            Logger.Instance.LogInformation("[startup] GenericMethod::GetMethod step done");
++
++            if (!SkipHooks("metadata")) GetTypeInfoFromTypeDefinitionIndexHook.ApplyHook();
++            Logger.Instance.LogInformation("[startup] MetadataCache::GetTypeInfoFromTypeDefinitionIndex step done");
++
++            if (!SkipHooks("fielddefault")) GetFieldDefaultValueHook.ApplyHook();
++            Logger.Instance.LogInformation("[startup] Class::GetFieldDefaultValue step done");
++
++            if (!Skip("classinit")) ClassInit ??= FindClassInit();
++            Logger.Instance.LogInformation("[startup] Class::Init = 0x{Address}",
++                ClassInitAddress.ToInt64().ToString("X2"));
++
++            if (!SkipHooks("fromtype")) FromIl2CppTypeHook.ApplyHook();
++            Logger.Instance.LogInformation("[startup] Class::FromIl2CppType step done");
++
++            if (!SkipHooks("fromname")) FromNameHook.ApplyHook();
++            Logger.Instance.LogInformation("[startup] Class::FromName step done; Setup complete");
++        }
++
++        /// <summary>
++        /// Diagnostic escape hatch: <c>MelonLoader/net6/il2cppinterop.skip.txt</c> holds one token per
++        /// line. Lets a broken startup be bisected without rebuilding.
++        /// Tokens: <c>all</c>, <c>assembly</c>, <c>hooks</c>, <c>genericmethod</c>, <c>metadata</c>,
++        /// <c>fielddefault</c>, <c>classinit</c>, <c>fromtype</c>, <c>fromname</c>.
++        /// </summary>
++        private static readonly HashSet<string> s_Skips = LoadSkips();
++
++        private static HashSet<string> LoadSkips()
++        {
++            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++            try
++            {
++                var dir = Path.GetDirectoryName(typeof(InjectorHelpers).Assembly.Location);
++                if (string.IsNullOrEmpty(dir)) return set;
++
++                var path = Path.Combine(dir, "il2cppinterop.skip.txt");
++                if (!File.Exists(path)) return set;
++
++                foreach (var raw in File.ReadAllLines(path))
++                {
++                    var token = raw.Trim();
++                    if (token.Length == 0 || token.StartsWith("#")) continue;
++                    set.Add(token);
++                }
++            }
++            catch
++            {
++                // A malformed skip file must never break startup.
++            }
++
++            return set;
++        }
++
++        private static bool Skip(string name) => s_Skips.Contains(name);
++
++        /// <summary>
++        /// Diagnostic action (enable with the <c>typedump</c> token): walks every loaded assembly and
++        /// calls <see cref="Assembly.GetTypes"/>, recording each name to its own file before the call.
++        ///
++        /// UniverseLib caches types across all assemblies at startup and can die inside
++        /// <c>GetTypes</c> with an uncatchable CLR fatal error, which leaves no clue as to which
++        /// assembly is responsible. Writing the name first turns that into a plain last-line answer.
++        /// The file is flushed per line on purpose - MelonLoader's log buffer does not survive a
++        /// fatal error.
++        /// </summary>
++        private static void DumpAssemblyTypes()
++        {
++            string path = null;
++            try
++            {
++                var dir = Path.GetDirectoryName(typeof(InjectorHelpers).Assembly.Location);
++                if (!string.IsNullOrEmpty(dir))
++                    path = Path.Combine(dir, "il2cppinterop.typedump.txt");
++            }
++            catch
++            {
++                // Fall through with path == null and skip the file, still logging normally.
++            }
++
++            void Line(string text)
++            {
++                Logger.Instance.LogInformation("[typedump] {Text}", text);
++                if (path == null) return;
++                try
++                {
++                    File.AppendAllText(path, text + Environment.NewLine);
++                }
++                catch
++                {
++                    // Ignore: the log line above is the fallback.
++                }
++            }
++
++            try
++            {
++                if (path != null) File.WriteAllText(path, string.Empty);
++
++                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
++                Line($"assemblies={assemblies.Length}");
++
++                foreach (var assembly in assemblies)
++                {
++                    var name = assembly.GetName().Name ?? "<unnamed>";
++                    Line($"BEGIN {name}");
++
++                    try
++                    {
++                        var types = assembly.GetTypes();
++                        Line($"  ok types={types.Length}");
++                    }
++                    catch (Exception ex)
++                    {
++                        Line($"  FAILED {ex.GetType().Name}: {ex.Message}");
++                    }
++                }
++
++                Line("DONE");
++            }
++            catch (Exception ex)
++            {
++                Line($"typedump aborted: {ex.GetType().Name}: {ex.Message}");
++            }
++        }
++
++        /// <summary>
++        /// Diagnostic action (enable with <c>typedump2</c>, or <c>typedump2:NameA,NameB</c> to pick the
++        /// assemblies): resolves one metadata token at a time and flushes a <c>TRY</c> line before each
++        /// resolve, so a CLR fatal error leaves the offending TypeDef token as the last line of the file.
++        ///
++        /// <c>Assembly.GetTypes</c> is all-or-nothing - a single bad TypeDef kills the process and tells
++        /// us nothing. Walking 0x02000001, 0x02000002, ... turns that into an exact answer. The token is
++        /// written before the resolve on purpose: the process is already dead when the next line would
++        /// have been written.
++        /// </summary>
++        private static void DumpTypesByToken()
++        {
++            string path = null;
++            StreamWriter writer = null;
++            try
++            {
++                var dir = Path.GetDirectoryName(typeof(InjectorHelpers).Assembly.Location);
++                if (!string.IsNullOrEmpty(dir))
++                    path = Path.Combine(dir, "il2cppinterop.typedump2.txt");
++            }
++            catch
++            {
++                // Fall through with path == null; only the logger remains.
++            }
++
++            void FileLine(string text)
++            {
++                if (writer == null) return;
++                try
++                {
++                    writer.WriteLine(text);
++                }
++                catch
++                {
++                    // Ignore: losing a line is better than breaking startup.
++                }
++            }
++
++            void Line(string text)
++            {
++                Logger.Instance.LogInformation("[typedump2] {Text}", text);
++                FileLine(text);
++            }
++
++            var targets = new List<string>();
++            foreach (var token in s_Skips)
++            {
++                if (!token.StartsWith("typedump2", StringComparison.OrdinalIgnoreCase)) continue;
++                var rest = token.Length > "typedump2".Length
++                    ? token.Substring("typedump2".Length).TrimStart(':')
++                    : string.Empty;
++                foreach (var part in rest.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
++                {
++                    var trimmed = part.Trim();
++                    if (trimmed.Length != 0) targets.Add(trimmed);
++                }
++            }
++            if (targets.Count == 0) targets.Add("UnityEngine.CoreModule");
++
++            const BindingFlags allDeclared = BindingFlags.Public | BindingFlags.NonPublic |
++                                             BindingFlags.Instance | BindingFlags.Static |
++                                             BindingFlags.DeclaredOnly;
++
++            try
++            {
++                // AutoFlush keeps every line on disk before the next runtime call - a CLR fatal error
++                // never unwinds, so buffered output would be lost exactly when it matters.
++                writer = path == null
++                    ? null
++                    : new StreamWriter(path, false) { AutoFlush = true };
++
++                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
++                Line($"assemblies={assemblies.Length} targets={string.Join(",", targets)}");
++
++                foreach (var assembly in assemblies)
++                {
++                    var name = assembly.GetName().Name ?? "<unnamed>";
++                    if (!targets.Any(target => string.Equals(target, name, StringComparison.OrdinalIgnoreCase)))
++                        continue;
++
++                    Line($"BEGIN {name}");
++
++                    Module[] modules;
++                    try
++                    {
++                        modules = assembly.GetModules(false);
++                    }
++                    catch (Exception ex)
++                    {
++                        Line($"  MODULES FAILED {ex.GetType().Name}: {ex.Message}");
++                        continue;
++                    }
++
++                    foreach (var module in modules)
++                    {
++                        Line($"  MODULE {module.Name}");
++                        var consecutiveMisses = 0;
++                        for (var index = 1; index <= 16384; index++)
++                        {
++                            var metadataToken = 0x02000000 | index;
++                            FileLine($"  TRY 0x{metadataToken:X8}");
++                            try
++                            {
++                                var type = module.ResolveType(metadataToken);
++                                FileLine($"  RES 0x{metadataToken:X8} {type.FullName}");
++                                var fieldCount = type.GetFields(allDeclared).Length;
++                                FileLine($"  FLD 0x{metadataToken:X8} {fieldCount}");
++                                var methodCount = type.GetMethods(allDeclared).Length;
++                                FileLine($"  OK  0x{metadataToken:X8} methods={methodCount}");
++                                consecutiveMisses = 0;
++                            }
++                            catch (ArgumentException)
++                            {
++                                // Past the end of the TypeDef table; give it a few tries in case of holes.
++                                if (++consecutiveMisses >= 8)
++                                {
++                                    Line($"  end of TypeDef table at 0x{metadataToken:X8}");
++                                    break;
++                                }
++                            }
++                            catch (Exception ex)
++                            {
++                                Line($"  ERR 0x{metadataToken:X8} {ex.GetType().Name}: {ex.Message}");
++                                consecutiveMisses = 0;
++                            }
++                        }
++                    }
++                }
++
++                Line("DONE");
++            }
++            catch (Exception ex)
++            {
++                Line($"typedump2 aborted: {ex.GetType().Name}: {ex.Message}");
++            }
++            finally
++            {
++                try
++                {
++                    writer?.Flush();
++                    writer?.Dispose();
++                }
++                catch
++                {
++                }
++            }
++        }
++
++        private static bool SkipHooks(string name) => s_Skips.Contains("hooks") || s_Skips.Contains(name);
++
++        private static readonly ConcurrentDictionary<string, int> s_HookHits = new();
++
++        /// <summary>
++        /// Diagnostic aid: records how often a detour is entered and logs the first few calls, so a
++        /// silent crash can be attributed to the patched function the engine was in the middle of.
++        /// Disable with the <c>nohitlog</c> token.
++        /// </summary>
++        internal static void LogHookHit(string name)
++        {
++            if (s_Skips.Contains("nohitlog")) return;
++
++            var hits = s_HookHits.AddOrUpdate(name, 1, (_, previous) => previous + 1);
++            if (hits <= 3 || hits % 500 == 0)
++                Logger.Instance.LogInformation("[hook] {Name} entered (#{Hits})", name, hits);
+         }
+ 
+         internal static long CreateClassToken(IntPtr classPointer)
+@@ -146,6 +466,9 @@ namespace Il2CppInterop.Runtime.Injection
+         internal delegate void d_ClassInit(Il2CppClass* klass);
+         internal static d_ClassInit ClassInit;
+ 
++        /// <summary>Address <see cref="ClassInit"/> was resolved to; kept for diagnostics.</summary>
++        internal static IntPtr ClassInitAddress;
++
+         private static readonly MemoryUtils.SignatureDefinition[] s_ClassInitSignatures =
+         {
+             new MemoryUtils.SignatureDefinition
+@@ -189,6 +512,12 @@ namespace Il2CppInterop.Runtime.Injection
+                 .Select(s => MemoryUtils.FindSignatureInModule(Il2CppModule, s))
+                 .FirstOrDefault(p => p != 0);
+ 
++            if (pClassInit != 0)
++                Logger.Instance.LogInformation("[startup] Class::Init from byte signature");
++
++            if (pClassInit == 0)
++                pClassInit = FindClassInitFromExport();
++
+             if (pClassInit == 0)
+             {
+                 Logger.Instance.LogWarning("Class::Init signatures have been exhausted, using a substitute!");
+@@ -196,9 +525,104 @@ namespace Il2CppInterop.Runtime.Injection
+             }
+ 
+             Logger.Instance.LogTrace("Class::Init: 0x{PClassInitAddress}", pClassInit.ToString("X2"));
++            ClassInitAddress = pClassInit;
+ 
+             return Marshal.GetDelegateForFunctionPointer<d_ClassInit>(pClassInit);
+         }
++
++        /// <summary>
++        /// In every il2cpp build <c>il2cpp_class_has_references</c> is
++        /// <c>if (!klass->size_inited) Class::Init(klass); return klass->has_references;</c>,
++        /// so the first call inside that export is Class::Init. The byte signatures above only
++        /// match the exact instruction sequences of the builds they were written against; a
++        /// runtime that was recompiled or patched changes the surrounding instructions while the
++        /// call itself stays. This anchors on the export instead of on code shape.
++        /// </summary>
++        private static nint FindClassInitFromExport()
++        {
++            if (!TryGetIl2CppExport(nameof(IL2CPP.il2cpp_class_has_references), out var exportAddress) ||
++                exportAddress == IntPtr.Zero)
++                return 0;
++
++            var moduleStart = Il2CppModule.BaseAddress.ToInt64();
++            var moduleEnd = moduleStart + Il2CppModule.ModuleMemorySize;
++
++            // Large il2cpp builds routinely export a bare `jmp` stub instead of the function body
++            // (Azur Promilia's GameAssembly.dll does exactly that), so scanning at the export
++            // address finds no `call` at all. Follow the stub first.
++            var bodyAddress = FollowJumpStub(exportAddress, moduleStart, moduleEnd);
++            if (bodyAddress == IntPtr.Zero)
++                return 0;
++
++            var code = (byte*)bodyAddress;
++
++            // The call sits within the first handful of instructions; don't wander into the next function.
++            for (var offset = 0; offset < 0x60; offset++)
++            {
++                if (code[offset] != 0xE8) continue; // call rel32
++                var target = (long)bodyAddress + offset + 5 + *(int*)(code + offset + 1);
++                if (target <= moduleStart || target >= moduleEnd) continue;
++                if (!LooksLikeFunctionStart((byte*)target)) continue;
++
++                Logger.Instance.LogTrace("Class::Init resolved from il2cpp_class_has_references: 0x{Address}",
++                    target.ToString("X2"));
++                return (nint)target;
++            }
++
++            return 0;
++        }
++
++        /// <summary>
++        /// Resolves the common MSVC export stub shapes to the function body: <c>jmp rel32</c>,
++        /// <c>jmp qword ptr [rip+disp32]</c> and <c>mov rax, imm64; jmp rax</c>. Returns zero when
++        /// the chain leaves the module or does not terminate within a few hops.
++        /// </summary>
++        private static nint FollowJumpStub(nint address, long moduleStart, long moduleEnd)
++        {
++            var current = (long)address;
++
++            for (var hop = 0; hop < 4; hop++)
++            {
++                if (current < moduleStart || current + 16 > moduleEnd)
++                    return IntPtr.Zero;
++
++                var code = (byte*)current;
++                long next;
++
++                if (code[0] == 0xE9) // jmp rel32
++                {
++                    next = current + 5 + *(int*)(code + 1);
++                }
++                else if (code[0] == 0xFF && code[1] == 0x25) // jmp qword ptr [rip + disp32]
++                {
++                    var slot = current + 6 + *(int*)(code + 2);
++                    if (slot < moduleStart || slot + sizeof(long) > moduleEnd) return IntPtr.Zero;
++                    next = *(long*)slot;
++                }
++                else if (code[0] == 0x48 && code[1] == 0xB8 && code[10] == 0xFF && code[11] == 0xE0)
++                {
++                    next = *(long*)(code + 2); // mov rax, imm64; jmp rax
++                }
++                else
++                {
++                    return (nint)current; // already at the body
++                }
++
++                if (next < moduleStart || next >= moduleEnd)
++                    return IntPtr.Zero;
++
++                current = next;
++            }
++
++            return IntPtr.Zero;
++        }
++
++        private static bool LooksLikeFunctionStart(byte* code)
++        {
++            // il2cpp prologues start with a push (0x40/0x48/0x4C REX-prefixed push, 0x53 push rbx,
++            // 0x55 push rbp, 0x56/0x57 push rsi/rdi) or a REX.W mov.
++            return code[0] is 0x40 or 0x48 or 0x4C or 0x53 or 0x55 or 0x56 or 0x57;
++        }
+         #endregion
+     }
+ }
+diff --git a/Il2CppInterop.Runtime/Runtime/CrashGuard.cs b/Il2CppInterop.Runtime/Runtime/CrashGuard.cs
+new file mode 100644
+index 0000000..3c0ae90
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/CrashGuard.cs
+@@ -0,0 +1,247 @@
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.IO;
++using System.Runtime.ExceptionServices;
++using System.Runtime.InteropServices;
++using System.Text;
++
++namespace Il2CppInterop.Runtime.Runtime;
++
++/// <summary>
++/// Writes a native crash report next to the runtime assembly.
++///
++/// A game that installs il2cpp detours can die with no managed exception, no WER event and no
++/// crash dump, which leaves nothing to debug from. A vectored exception handler sees the fault
++/// before the CRT does, so at minimum the exception code and faulting address get recorded; the
++/// address is then mapped back to module + RVA so it can be disassembled statically.
++///
++/// Only fatal codes are recorded - C++ exceptions and breakpoints are used for ordinary control
++/// flow inside il2cpp and would drown the log.
++/// </summary>
++internal static unsafe class CrashGuard
++{
++    private const uint ExceptionAccessViolation = 0xC0000005;
++    private const uint ExceptionStackOverflow = 0xC00000FD;
++    private const uint ExceptionFailFast = 0xC0000409;
++    private const uint ExceptionHeapCorruption = 0xC0000374;
++    private const uint ExceptionIllegalInstruction = 0xC000001D;
++    private const uint ExceptionInPageError = 0xC0000006;
++    private const uint ExceptionGuardPage = 0x80000001;
++
++    private const int MaxReports = 24;
++
++    private static int s_reports;
++    private static readonly List<(string Name, long Start, long End)> s_modules = new();
++    private static readonly object s_lock = new();
++    private static string s_logPath;
++
++    private delegate int VectoredHandler(IntPtr exceptionPointers);
++
++    [DllImport("kernel32.dll", SetLastError = true)]
++    private static extern IntPtr AddVectoredExceptionHandler(uint first, VectoredHandler handler);
++
++    private static VectoredHandler s_handler; // keep a root so the delegate is not collected
++
++    public static void Install()
++    {
++        if (s_handler != null) return;
++
++        try
++        {
++            var dir = Path.GetDirectoryName(typeof(CrashGuard).Assembly.Location);
++            if (string.IsNullOrEmpty(dir)) return;
++            s_logPath = Path.Combine(dir, "il2cppinterop.crash.txt");
++
++            foreach (ProcessModule module in Process.GetCurrentProcess().Modules)
++            {
++                try
++                {
++                    s_modules.Add((module.ModuleName, module.BaseAddress.ToInt64(),
++                        module.BaseAddress.ToInt64() + module.ModuleMemorySize));
++                }
++                catch
++                {
++                    // Some system modules throw on access; skipping one is harmless.
++                }
++            }
++
++            s_handler = OnException;
++            AddVectoredExceptionHandler(1, s_handler);
++
++            s_exceptionPath = Path.Combine(dir, "il2cppinterop.exceptions.txt");
++            InstallManagedHandlers();
++
++            Append($"--- crash guard installed, {s_modules.Count} modules mapped ---");
++        }
++        catch
++        {
++            // Diagnostics must never take the process down on their own.
++        }
++    }
++
++    private static int OnException(IntPtr exceptionPointers)
++    {
++        try
++        {
++            if (s_reports++ >= MaxReports) return 0;
++
++            var record = *(ExceptionRecord**)exceptionPointers;
++            var code = (uint)record->ExceptionCode;
++            if (!IsFatal(code)) return 0;
++
++            var address = (long)record->ExceptionAddress;
++            var where = Resolve(address);
++
++            var detail = new StringBuilder();
++            detail.Append("code=0x").Append(code.ToString("X8"));
++            detail.Append(" addr=0x").Append(address.ToString("X"));
++            detail.Append(" at=").Append(where);
++
++            if (code == ExceptionAccessViolation && record->NumberParameters >= 2)
++            {
++                var kind = record->ExceptionInformation[0] == 0 ? "read" : record->ExceptionInformation[0] == 1 ? "write" : "execute";
++                detail.Append(" op=").Append(kind);
++                detail.Append(" target=0x").Append(((long)record->ExceptionInformation[1]).ToString("X"));
++            }
++
++            Append(detail.ToString());
++        }
++        catch
++        {
++            // Swallow: an exception inside the handler would recurse.
++        }
++
++        return 0; // EXCEPTION_CONTINUE_SEARCH
++    }
++
++    private static string s_exceptionPath;
++    private static int s_exceptionTotal;
++    private static readonly Dictionary<string, int> s_exceptionCounts = new();
++    private const int MaxExceptions = 400;
++    private const int MaxExceptionsPerType = 15;
++
++    /// <summary>
++    /// A CLR fatal error and an unhandled managed exception both end the process with output on
++    /// stderr only, which MelonLoader's file log never sees. Subscribing to the managed events
++    /// turns that invisible death into a written-down one.
++    ///
++    /// FirstChanceException also captures exceptions that are caught further up - that is what
++    /// makes an il2cpp <c>ExecutionEngineException</c> during AddComponent visible even though
++    /// Unity swallows it and merely logs "The script 'X' could not be instantiated!".
++    /// </summary>
++    private static void InstallManagedHandlers()
++    {
++        try
++        {
++            AppDomain.CurrentDomain.FirstChanceException += OnFirstChanceException;
++            AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
++        }
++        catch
++        {
++            // Diagnostics must never take the process down on their own.
++        }
++    }
++
++    private static void OnFirstChanceException(object sender, FirstChanceExceptionEventArgs e)
++    {
++        try
++        {
++            var exception = e.Exception;
++            if (exception == null) return;
++
++            var type = exception.GetType().FullName ?? "<unknown>";
++            int seen;
++            lock (s_lock)
++            {
++                if (s_exceptionTotal >= MaxExceptions) return;
++                s_exceptionCounts.TryGetValue(type, out seen);
++                if (seen >= MaxExceptionsPerType) return;
++                s_exceptionCounts[type] = seen + 1;
++                s_exceptionTotal++;
++            }
++
++            WriteException($"fce {type}: {exception.Message}{Environment.NewLine}{ShortStack(exception)}");
++        }
++        catch
++        {
++            // Swallow: an exception inside the handler would recurse.
++        }
++    }
++
++    private static void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
++    {
++        try
++        {
++            var text = e.ExceptionObject?.ToString() ?? "<null>";
++            WriteException($"UNHANDLED terminating={e.IsTerminating}{Environment.NewLine}{text}");
++        }
++        catch
++        {
++        }
++    }
++
++    private static string ShortStack(Exception exception)
++    {
++        var stack = exception.StackTrace;
++        if (string.IsNullOrEmpty(stack)) return "    <no stack>";
++
++        var lines = stack.Split('\n');
++        var builder = new StringBuilder();
++        for (var i = 0; i < lines.Length && i < 8; i++)
++            builder.Append("    ").Append(lines[i].TrimEnd()).Append(Environment.NewLine);
++
++        return builder.ToString();
++    }
++
++    private static void WriteException(string text)
++    {
++        if (string.IsNullOrEmpty(s_exceptionPath)) return;
++
++        lock (s_lock)
++        {
++            File.AppendAllText(s_exceptionPath,
++                $"[{DateTime.Now:HH:mm:ss.fff}] {text}{Environment.NewLine}");
++        }
++    }
++
++    private static bool IsFatal(uint code)
++    {
++        return code is ExceptionAccessViolation or ExceptionStackOverflow or ExceptionFailFast
++            or ExceptionHeapCorruption or ExceptionIllegalInstruction or ExceptionInPageError
++            or ExceptionGuardPage;
++    }
++
++    private static string Resolve(long address)
++    {
++        foreach (var module in s_modules)
++        {
++            if (address < module.Start || address >= module.End) continue;
++            return $"{module.Name}+0x{(address - module.Start):X}";
++        }
++
++        return "<unmapped>";
++    }
++
++    private static void Append(string line)
++    {
++        if (string.IsNullOrEmpty(s_logPath)) return;
++
++        lock (s_lock)
++        {
++            File.AppendAllText(s_logPath,
++                $"[{DateTime.Now:HH:mm:ss.fff}] {line}{Environment.NewLine}");
++        }
++    }
++
++    [StructLayout(LayoutKind.Sequential)]
++    private struct ExceptionRecord
++    {
++        public int ExceptionCode;
++        public int ExceptionFlags;
++        public IntPtr ExceptionRecordPtr;
++        public IntPtr ExceptionAddress;
++        public int NumberParameters;
++        public fixed long ExceptionInformation[15];
++    }
++}
+diff --git a/Il2CppInterop.Runtime/Runtime/LayoutProbe.cs b/Il2CppInterop.Runtime/Runtime/LayoutProbe.cs
+new file mode 100644
+index 0000000..d387a86
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/LayoutProbe.cs
+@@ -0,0 +1,206 @@
++using System;
++using System.Runtime.InteropServices;
++using Il2CppInterop.Common;
++using Microsoft.Extensions.Logging;
++
++namespace Il2CppInterop.Runtime.Runtime;
++
++/// <summary>
++/// Some games ship an il2cpp runtime that is patched relative to stock Unity while still reporting
++/// a stock Unity version. Il2CppInterop picks its struct handlers from that reported version, so a
++/// fork silently gets the wrong layout and every field past the insertion point reads garbage.
++///
++/// This probe measures the real layout of the running module instead of trusting the version
++/// string: it asks the engine for a class/method through the il2cpp exports (which always use the
++/// true offsets) and compares the answer with what the stock struct offsets yield.
++///
++/// Two things are measured:
++///
++/// 1. <b>Which layout family the runtime is built on.</b> The 2021.x family puts Il2CppClass.flags
++///    at 0x114, the 2022.x family puts it at 0x118 (that struct gained stack_slot_size and lost
++///    naturalAligment). This matters twice: the padding probe below is anchored on the family's
++///    stock offsets, and the padded handler we ship models the 2021.x struct.
++///
++/// 2. <b>How many bytes the runtime inserts.</b> Layouts confirmed against two shipped games:
++///
++///      Endfield      (Unity 2021.3.34f5, metadata 29) - reports the 2021.x family
++///      Azur Promilia (Unity 2022.3.62f3, metadata 31) - <i>also</i> reports the 2021.x family,
++///                                                       even though its Unity version string
++///                                                       makes Il2CppInterop select the 2022.x
++///                                                       handlers
++///
++///    Both insert the same amount:
++///      Il2CppClass      - two extra bytes after `token`      (method_count 0x11C -> 0x11E)
++///      Il2CppMethodInfo - one extra byte after `slot`        (parameters_count 0x52 -> 0x53)
++///
++/// So the measured padding, not the Unity version, is what decides whether the padded handlers apply.
++/// </summary>
++internal static class Il2CppLayoutProbe
++{
++    /// <summary>Il2CppClass.flags in the 2021.x (metadata 29) struct.</summary>
++    private const int ClassFlagsOffset2021 = 0x114;
++
++    /// <summary>Il2CppClass.flags in the 2022.x (metadata 31) struct.</summary>
++    private const int ClassFlagsOffset2022 = 0x118;
++
++    private const int ClassMethodCountOffset2021 = 0x11C;
++    private const int ClassMethodCountOffset2022 = 0x120;
++
++    private const int MethodInfoParametersCountOffset = 0x52;
++
++    private static bool s_ran;
++
++    /// <summary>Which stock struct the running runtime is built on.</summary>
++    public enum LayoutFamily
++    {
++        Unknown = 0,
++        V2021 = 1,
++        V2022 = 2
++    }
++
++    public static LayoutFamily Family { get; private set; }
++
++    /// <summary>Extra bytes between `token` and `method_count` in <c>Il2CppClass</c>.</summary>
++    public static int ClassStructPadding { get; private set; }
++
++    /// <summary>Extra bytes between `slot` and `parameters_count` in <c>Il2CppMethodInfo</c>.</summary>
++    public static int MethodInfoStructPadding { get; private set; }
++
++    public static void Run()
++    {
++        if (s_ran) return;
++        s_ran = true;
++
++        try
++        {
++            var klass = FindProbeClass();
++            if (klass == IntPtr.Zero)
++            {
++                Logger.Instance.LogWarning("il2cpp layout probe: no probe class found, assuming stock layout");
++                return;
++            }
++
++            ProbeFamily(klass);
++            ProbeClassLayout(klass);
++            ProbeMethodInfoLayout(klass);
++
++            Logger.Instance.LogInformation(
++                "il2cpp layout probe: {Family} structs, Il2CppClass +{ClassPad} byte(s), Il2CppMethodInfo +{MethodPad} byte(s)",
++                Family, ClassStructPadding, MethodInfoStructPadding);
++        }
++        catch (Exception ex)
++        {
++            Logger.Instance.LogWarning("il2cpp layout probe failed, assuming stock layout: {Message}", ex.Message);
++        }
++    }
++
++    private static IntPtr FindProbeClass()
++    {
++        var corlib = IL2CPP.il2cpp_get_corlib();
++        if (corlib == IntPtr.Zero) return IntPtr.Zero;
++
++        string[] candidates = { "String", "Object", "Exception", "Int32" };
++        foreach (var name in candidates)
++        {
++            var klass = IL2CPP.il2cpp_class_from_name(corlib, "System", name);
++            if (klass != IntPtr.Zero) return klass;
++        }
++
++        return IntPtr.Zero;
++    }
++
++    /// <summary>
++    /// The engine always reads flags from the offset its own struct uses, so comparing that value
++    /// against both candidate offsets identifies the family without guessing.
++    /// </summary>
++    private static void ProbeFamily(IntPtr klass)
++    {
++        var engineFlags = unchecked((uint)IL2CPP.il2cpp_class_get_flags(klass));
++
++        var at2021 = ReadUInt32(klass + ClassFlagsOffset2021);
++        var at2022 = ReadUInt32(klass + ClassFlagsOffset2022);
++
++        if (at2021 == engineFlags)
++        {
++            Family = LayoutFamily.V2021;
++        }
++        else if (at2022 == engineFlags)
++        {
++            Family = LayoutFamily.V2022;
++        }
++        else
++        {
++            Family = LayoutFamily.Unknown;
++            Logger.Instance.LogWarning(
++                "il2cpp layout probe: Il2CppClass.flags is at neither 0x{Off2021:X} nor 0x{Off2022:X} (engine says 0x{Flags:X}, found 0x{A:X} / 0x{B:X})",
++                ClassFlagsOffset2021, ClassFlagsOffset2022, engineFlags, at2021, at2022);
++        }
++    }
++
++    private static void ProbeClassLayout(IntPtr klass)
++    {
++        var counted = CountMethods(klass);
++        if (counted <= 0) return;
++
++        var stockOffset = Family == LayoutFamily.V2022
++            ? ClassMethodCountOffset2022
++            : ClassMethodCountOffset2021;
++
++        var atStock = ReadUInt16(klass + stockOffset);
++        var atShifted = ReadUInt16(klass + stockOffset + 2);
++
++        if (atStock == counted) ClassStructPadding = 0;
++        else if (atShifted == counted) ClassStructPadding = 2;
++        else
++            Logger.Instance.LogWarning(
++                "il2cpp layout probe: neither 0x{Stock:X} nor 0x{Shifted:X} matches the engine's method count {Count}",
++                atStock, atShifted, counted);
++    }
++
++    private static void ProbeMethodInfoLayout(IntPtr klass)
++    {
++        int stockVotes = 0, shiftedVotes = 0;
++        var iter = IntPtr.Zero;
++
++        for (var i = 0; i < 400; i++)
++        {
++            var method = IL2CPP.il2cpp_class_get_methods(klass, ref iter);
++            if (method == IntPtr.Zero) break;
++
++            var paramCount = (int)IL2CPP.il2cpp_method_get_param_count(method);
++            if (paramCount == 0 || paramCount > 32) continue; // 0 is ambiguous often enough to skip
++
++            if (ReadByte(method + MethodInfoParametersCountOffset) == paramCount) stockVotes++;
++            if (ReadByte(method + MethodInfoParametersCountOffset + 1) == paramCount) shiftedVotes++;
++        }
++
++        if (stockVotes == 0 && shiftedVotes == 0) return;
++
++        MethodInfoStructPadding = shiftedVotes > stockVotes ? 1 : 0;
++
++        if (shiftedVotes == stockVotes)
++            Logger.Instance.LogWarning(
++                "il2cpp layout probe: ambiguous Il2CppMethodInfo layout (stock={Stock} shifted={Shifted})",
++                stockVotes, shiftedVotes);
++    }
++
++    private static int CountMethods(IntPtr klass)
++    {
++        var count = 0;
++        var iter = IntPtr.Zero;
++        while (true)
++        {
++            var method = IL2CPP.il2cpp_class_get_methods(klass, ref iter);
++            if (method == IntPtr.Zero) break;
++            if (++count > 10000) break;
++        }
++
++        return count;
++    }
++
++    private static ushort ReadUInt16(IntPtr address) => unchecked((ushort)Marshal.ReadInt16(address));
++
++    private static uint ReadUInt32(IntPtr address) => unchecked((uint)Marshal.ReadInt32(address));
++
++    private static byte ReadByte(IntPtr address) => Marshal.ReadByte(address);
++}
+diff --git a/Il2CppInterop.Runtime/Runtime/TypeLoadProbe.cs b/Il2CppInterop.Runtime/Runtime/TypeLoadProbe.cs
+new file mode 100644
+index 0000000..cf946e8
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/TypeLoadProbe.cs
+@@ -0,0 +1,88 @@
++using System;
++using System.Reflection;
++using System.Runtime.CompilerServices;
++using Il2CppInterop.Common;
++using Microsoft.Extensions.Logging;
++
++namespace Il2CppInterop.Runtime.Runtime;
++
++/// <summary>
++/// UniverseLib calls <c>Assembly.GetTypes()</c> on every loaded assembly while building its type
++/// cache, and on some setups the CLR aborts the process part way through with an uncatchable
++/// "Invalid Program" failfast - no managed exception, nothing in the MelonLoader log, so the
++/// offending assembly is impossible to identify afterwards.
++///
++/// Walking the same list here, logging each name *before* the call, turns that abort into a
++/// pointer: the last name without a matching result line is the assembly that killed the process.
++/// </summary>
++internal static class TypeLoadProbe
++{
++    private static int s_ran;
++
++    public static void RunOnce()
++    {
++        if (System.Threading.Interlocked.Exchange(ref s_ran, 1) != 0) return;
++        Run();
++    }
++
++    public static void Run()
++    {
++        Assembly[] assemblies;
++        try
++        {
++            assemblies = AppDomain.CurrentDomain.GetAssemblies();
++        }
++        catch (Exception ex)
++        {
++            Logger.Instance.LogWarning("[typeprobe] could not enumerate assemblies: {Message}", ex.Message);
++            return;
++        }
++
++        Logger.Instance.LogInformation("[typeprobe] probing {Count} loaded assemblies", assemblies.Length);
++
++        foreach (var assembly in assemblies)
++        {
++            string name;
++            try
++            {
++                name = assembly.GetName().Name ?? "<unnamed>";
++            }
++            catch
++            {
++                name = "<unnamed>";
++            }
++
++            // Logged before the call on purpose: if the CLR aborts inside GetTypes, this line is the
++            // only record of what was being loaded.
++            Logger.Instance.LogInformation("[typeprobe] > {Name}", name);
++
++            var result = ProbeTypes(assembly);
++            Logger.Instance.LogInformation("[typeprobe] < {Name} {Result}", name, result);
++        }
++
++        Logger.Instance.LogInformation("[typeprobe] all assemblies survived GetTypes");
++    }
++
++    // Kept out of line so the JIT compiles this method (not the loop above) as the caller of
++    // GetTypes; if the call is what the runtime rejects, the loop still gets its log line out first.
++    [MethodImpl(MethodImplOptions.NoInlining)]
++    private static string ProbeTypes(Assembly assembly)
++    {
++        try
++        {
++            return $"{assembly.GetTypes().Length} types";
++        }
++        catch (ReflectionTypeLoadException ex)
++        {
++            var loaded = 0;
++            foreach (var type in ex.Types)
++                if (type != null) loaded++;
++
++            return $"ReflectionTypeLoadException {loaded}/{ex.Types.Length} types (catchable)";
++        }
++        catch (Exception ex)
++        {
++            return $"{ex.GetType().Name}: {ex.Message}";
++        }
++    }
++}
+diff --git a/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs b/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs
+index 0e4e1f7..a98c992 100644
+--- a/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs
++++ b/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs
+@@ -112,6 +112,42 @@ public static class UnityVersionHandler
+         parameterInfoStructHandler = GetHandler<INativeParameterInfoStructHandler>();
+         propertyInfoStructHandler = GetHandler<INativePropertyInfoStructHandler>();
+         typeStructHandler = GetHandler<INativeTypeStructHandler>();
++
++        ApplyDetectedLayoutOverrides();
++    }
++
++    /// <summary>
++    /// Games that ship a patched il2cpp keep the stock Unity version string, so the version-keyed
++    /// handler selection above cannot tell them apart. Probe the live module and swap in the
++    /// matching layout when the runtime has extra fields the stock structs do not model.
++    /// </summary>
++    private static void ApplyDetectedLayoutOverrides()
++    {
++        Il2CppLayoutProbe.Run();
++
++        // The padded handlers model the 2021.x struct with the extra bytes spliced in. They are the
++        // right choice whenever the probe reports that family, whatever handler the Unity version
++        // string picked - a 2022.3 game can still ship a 2021.x-based struct (Azur Promilia does).
++        var classPadded = Il2CppLayoutProbe.ClassStructPadding != 0;
++        if (classPadded && Il2CppLayoutProbe.Family == Il2CppLayoutProbe.LayoutFamily.V2021)
++        {
++            classStructHandler = new NativeClassStructHandler_29_0_Padded();
++        }
++        else if (classPadded)
++        {
++            Logger.Instance.LogWarning(
++                "Detected a padded Il2CppClass layout on {Family} structs, but the padded handler only models the 2021.x struct; keeping {Handler}",
++                Il2CppLayoutProbe.Family, classStructHandler.GetType().Name);
++        }
++
++        var methodPadded = Il2CppLayoutProbe.MethodInfoStructPadding != 0;
++        if (methodPadded)
++        {
++            // Il2CppMethodInfo keeps the same field layout across the 29_0/29_1/29_2 handlers (only
++            // the bitfield enum names differ), so the 29_0-based padded handler is valid for all of
++            // them.
++            methodInfoStructHandler = new NativeMethodInfoStructHandler_29_0_Padded();
++        }
+     }
+ 
+     private static T GetHandler<T>()
+diff --git a/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_29_0_Padded.cs b/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_29_0_Padded.cs
+new file mode 100644
+index 0000000..7afe4b6
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_29_0_Padded.cs
+@@ -0,0 +1,237 @@
++using System;
++using System.Runtime.InteropServices;
++using Il2CppInterop.Runtime.Runtime.VersionSpecific.Type;
++
++namespace Il2CppInterop.Runtime.Runtime.VersionSpecific.Class
++{
++    /// <summary>
++    /// 2021.2+ (metadata v29) <see cref="Il2CppClass"/> layout for runtimes that carry an extra
++    /// 16-bit field between <c>token</c> and <c>method_count</c>.
++    ///
++    /// Stock Unity puts <c>method_count</c> at 0x11C and <c>typeHierarchyDepth</c> at 0x12C.
++    /// Some shipped runtimes (verified against Endfield / 明日方舟：终末地, GameAssembly.dll build
++    /// 2025-11-25) keep every field up to and including <c>token</c> in place but insert two bytes
++    /// right after it, so every following member moves down by two:
++    ///
++    ///   il2cpp_class_is_subclass_of  -> movzx eax, byte ptr [rcx+0x12E]   (typeHierarchyDepth)
++    ///   il2cpp_class_has_references  -> test byte ptr [rcx+0x135], 1      (size_inited)
++    ///   il2cpp_class_get_flags       -> mov eax, dword ptr [rcx+0x114]    (flags, unchanged)
++    ///
++    /// Nothing selects this handler through <see cref="ApplicableToUnityVersionsSinceAttribute"/>:
++    /// the reported Unity version is the stock one, so <see cref="UnityVersionHandler"/> probes the
++    /// live module and swaps this handler in when the padding is present. The struct is still
++    /// 0x138 bytes because the trailing bitfields keep it 8-byte aligned, so vtable placement and
++    /// allocation sizes are unchanged.
++    /// </summary>
++    public unsafe class NativeClassStructHandler_29_0_Padded : INativeClassStructHandler
++    {
++        public int Size() => sizeof(Il2CppClass_29_0_Padded);
++
++        public INativeClassStruct CreateNewStruct(int vTableSlots)
++        {
++            IntPtr ptr = Marshal.AllocHGlobal(Size() + sizeof(VirtualInvokeData) * vTableSlots);
++            Il2CppClass_29_0_Padded* _ = (Il2CppClass_29_0_Padded*)ptr;
++            *_ = default;
++            return new NativeStructWrapper(ptr);
++        }
++
++        public INativeClassStruct Wrap(Il2CppClass* ptr)
++        {
++            if (ptr == null) return null;
++            return new NativeStructWrapper((IntPtr)ptr);
++        }
++
++        internal unsafe struct Il2CppClass_29_0_Padded
++        {
++            public Il2CppImage* image;
++            public void* gc_desc;
++            public byte* name;
++            public byte* namespaze;
++            public NativeTypeStructHandler_27_0.Il2CppType_27_0 byval_arg;
++            public NativeTypeStructHandler_27_0.Il2CppType_27_0 this_arg;
++            public Il2CppClass* element_class;
++            public Il2CppClass* castClass;
++            public Il2CppClass* declaringType;
++            public Il2CppClass* parent;
++            public void* generic_class;
++            public Il2CppMetadataTypeHandle typeMetadataHandle;
++            public void* interopData;
++            public Il2CppClass* klass;
++            public Il2CppFieldInfo* fields;
++            public Il2CppEventInfo* events;
++            public Il2CppPropertyInfo* properties;
++            public Il2CppMethodInfo** methods;
++            public Il2CppClass** nestedTypes;
++            public Il2CppClass** implementedInterfaces;
++            public Il2CppRuntimeInterfaceOffsetPair* interfaceOffsets;
++            public void* static_fields;
++            public void* rgctx_data;
++            public Il2CppClass** typeHierarchy;
++            public void* unity_user_data;
++            public uint initializationExceptionGCHandle;
++            public uint cctor_started;
++            public uint cctor_finished_or_no_cctor;
++            public IntPtr cctor_thread;
++            public Il2CppMetadataGenericContainerHandle genericContainerHandle;
++            public uint instance_size;
++            public uint actualSize;
++            public uint element_size;
++            public int native_size;
++            public uint static_fields_size;
++            public uint thread_static_fields_size;
++            public int thread_static_fields_offset;
++            public uint flags;
++            public uint token;
++            // The two bytes that stock Unity does not have.
++            public ushort extra_field_after_token;
++            public ushort method_count;
++            public ushort property_count;
++            public ushort field_count;
++            public ushort event_count;
++            public ushort nested_type_count;
++            public ushort vtable_count;
++            public ushort interfaces_count;
++            public ushort interface_offsets_count;
++            public byte typeHierarchyDepth;
++            public byte genericRecursionDepth;
++            public byte rank;
++            public byte minimumAlignment;
++            public byte naturalAligment;
++            public byte packingSize;
++            public Bitfield0 _bitfield0;
++            public Bitfield1 _bitfield1;
++            // Stock Unity stops after _bitfield1; this runtime reads a third bitfield byte at 0x136.
++            public byte _bitfield2;
++
++            internal enum Bitfield0 : byte
++            {
++                BIT_initialized_and_no_error = 0,
++                initialized_and_no_error = (1 << BIT_initialized_and_no_error),
++                BIT_initialized = 1,
++                initialized = (1 << BIT_initialized),
++                BIT_enumtype = 2,
++                enumtype = (1 << BIT_enumtype),
++                BIT_nullabletype = 3,
++                nullabletype = (1 << BIT_nullabletype),
++                BIT_is_generic = 4,
++                is_generic = (1 << BIT_is_generic),
++                BIT_has_references = 5,
++                has_references = (1 << BIT_has_references),
++                BIT_init_pending = 6,
++                init_pending = (1 << BIT_init_pending),
++                BIT_size_init_pending = 7,
++                size_init_pending = (1 << BIT_size_init_pending),
++            }
++
++            internal enum Bitfield1 : byte
++            {
++                BIT_size_inited = 0,
++                size_inited = (1 << BIT_size_inited),
++                BIT_has_finalize = 1,
++                has_finalize = (1 << BIT_has_finalize),
++                BIT_has_cctor = 2,
++                has_cctor = (1 << BIT_has_cctor),
++                BIT_is_blittable = 3,
++                is_blittable = (1 << BIT_is_blittable),
++                BIT_is_import_or_windows_runtime = 4,
++                is_import_or_windows_runtime = (1 << BIT_is_import_or_windows_runtime),
++                BIT_is_vtable_initialized = 5,
++                is_vtable_initialized = (1 << BIT_is_vtable_initialized),
++                BIT_is_byref_like = 6,
++                is_byref_like = (1 << BIT_is_byref_like),
++            }
++        }
++
++        internal class NativeStructWrapper : INativeClassStruct
++        {
++            public NativeStructWrapper(IntPtr ptr) => Pointer = ptr;
++
++            private static readonly int _bitfield0offset = Marshal.OffsetOf<Il2CppClass_29_0_Padded>(nameof(Il2CppClass_29_0_Padded._bitfield0)).ToInt32();
++            private static readonly int _bitfield1offset = Marshal.OffsetOf<Il2CppClass_29_0_Padded>(nameof(Il2CppClass_29_0_Padded._bitfield1)).ToInt32();
++
++            public IntPtr Pointer { get; }
++            private Il2CppClass_29_0_Padded* _ => (Il2CppClass_29_0_Padded*)Pointer;
++            public IntPtr VTable => IntPtr.Add(Pointer, sizeof(Il2CppClass_29_0_Padded));
++            public Il2CppClass* ClassPointer => (Il2CppClass*)Pointer;
++            public INativeTypeStruct ByValArg => UnityVersionHandler.Wrap((Il2CppTypeStruct*)&_->byval_arg);
++            public INativeTypeStruct ThisArg => UnityVersionHandler.Wrap((Il2CppTypeStruct*)&_->this_arg);
++            public ref uint InstanceSize => ref _->instance_size;
++            public ref ushort VtableCount => ref _->vtable_count;
++            public ref ushort InterfaceCount => ref _->interfaces_count;
++            public ref ushort InterfaceOffsetsCount => ref _->interface_offsets_count;
++            public ref byte TypeHierarchyDepth => ref _->typeHierarchyDepth;
++            public ref int NativeSize => ref _->native_size;
++            public ref uint ActualSize => ref _->actualSize;
++            public ref ushort MethodCount => ref _->method_count;
++            public ref ushort FieldCount => ref _->field_count;
++            public ref Il2CppClassAttributes Flags => ref *(Il2CppClassAttributes*)&_->flags;
++            public ref IntPtr Name => ref *(IntPtr*)&_->name;
++            public ref IntPtr Namespace => ref *(IntPtr*)&_->namespaze;
++            public ref Il2CppImage* Image => ref _->image;
++            public ref Il2CppClass* Parent => ref _->parent;
++            public ref Il2CppClass* ElementClass => ref _->element_class;
++            public ref Il2CppClass* CastClass => ref _->castClass;
++            public ref Il2CppClass* DeclaringType => ref _->declaringType;
++            public ref Il2CppClass* Class => ref _->klass;
++            public ref Il2CppFieldInfo* Fields => ref _->fields;
++            public ref Il2CppMethodInfo** Methods => ref _->methods;
++            public ref Il2CppClass** ImplementedInterfaces => ref _->implementedInterfaces;
++            public ref Il2CppRuntimeInterfaceOffsetPair* InterfaceOffsets => ref _->interfaceOffsets;
++            public ref Il2CppClass** TypeHierarchy => ref _->typeHierarchy;
++
++            public bool ValueType
++            {
++                get => ByValArg.ValueType && ThisArg.ValueType;
++                set { }
++            }
++
++            public bool Initialized
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized, value);
++            }
++
++            public bool EnumType
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_enumtype);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_enumtype, value);
++            }
++
++            public bool IsGeneric
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_is_generic);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_is_generic, value);
++            }
++
++            public bool HasReferences
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_has_references);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_has_references, value);
++            }
++
++            public bool SizeInited
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_size_inited);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_size_inited, value);
++            }
++
++            public bool HasFinalize
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_has_finalize);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_has_finalize, value);
++            }
++
++            public bool IsVtableInitialized
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_is_vtable_initialized);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_is_vtable_initialized, value);
++            }
++
++            public bool InitializedAndNoError
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized_and_no_error);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized_and_no_error, value);
++            }
++        }
++    }
++}
+diff --git a/Il2CppInterop.Runtime/Runtime/VersionSpecific/MethodInfo/MethodInfo_29_0_Padded.cs b/Il2CppInterop.Runtime/Runtime/VersionSpecific/MethodInfo/MethodInfo_29_0_Padded.cs
+new file mode 100644
+index 0000000..6471b54
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/VersionSpecific/MethodInfo/MethodInfo_29_0_Padded.cs
+@@ -0,0 +1,114 @@
++using System;
++using System.Runtime.InteropServices;
++namespace Il2CppInterop.Runtime.Runtime.VersionSpecific.MethodInfo
++{
++    /// <summary>
++    /// 2021.2+ (metadata v29) <see cref="Il2CppMethodInfo"/> layout for runtimes that carry an
++    /// extra byte between <c>slot</c> and <c>parameters_count</c>.
++    ///
++    /// Stock Unity puts <c>parameters_count</c> at 0x52 and the bitfield at 0x53; the shipped
++    /// Endfield runtime puts them at 0x53 / 0x54, as read straight out of GameAssembly.dll:
++    ///
++    ///   il2cpp_method_get_param_count -> movzx eax, byte ptr [rcx+0x53]
++    ///   il2cpp_method_is_generic      -> movzx eax, byte ptr [rcx+0x54]; and al, 1
++    ///   il2cpp_method_get_token       -> mov eax, dword ptr [rcx+0x48]   (unchanged)
++    ///
++    /// Everything up to and including <c>slot</c> is identical to stock, and the struct still
++    /// rounds up to 0x58 bytes, so allocation sizes are unchanged.
++    /// Selected by <see cref="UnityVersionHandler"/> after probing the live module, not through
++    /// <see cref="ApplicableToUnityVersionsSinceAttribute"/>.
++    /// </summary>
++    public unsafe class NativeMethodInfoStructHandler_29_0_Padded : INativeMethodInfoStructHandler
++    {
++        public int Size() => sizeof(Il2CppMethodInfo_29_0_Padded);
++
++        public INativeMethodInfoStruct CreateNewStruct()
++        {
++            IntPtr ptr = Marshal.AllocHGlobal(Size());
++            Il2CppMethodInfo_29_0_Padded* _ = (Il2CppMethodInfo_29_0_Padded*)ptr;
++            *_ = default;
++            return new NativeStructWrapper(ptr);
++        }
++
++        public INativeMethodInfoStruct Wrap(Il2CppMethodInfo* ptr)
++        {
++            if (ptr == null) return null;
++            return new NativeStructWrapper((IntPtr)ptr);
++        }
++
++        internal unsafe struct Il2CppMethodInfo_29_0_Padded
++        {
++            public void* methodPointer;
++            public void* virtualMethodPointer;
++            public void* invoker_method;
++            public byte* name;
++            public Il2CppClass* klass;
++            public Il2CppTypeStruct* return_type;
++            public Il2CppTypeStruct** parameters;
++            public void* runtime_data;
++            public void* generic_data;
++            public uint token;
++            public ushort flags;
++            public ushort iflags;
++            public ushort slot;
++            // The byte that stock Unity does not have.
++            public byte extra_field_after_slot;
++            public byte parameters_count;
++            public Bitfield0 _bitfield0;
++
++            internal enum Bitfield0 : byte
++            {
++                BIT_is_generic = 0,
++                is_generic = (1 << BIT_is_generic),
++                BIT_is_inflated = 1,
++                is_inflated = (1 << BIT_is_inflated),
++                BIT_wrapper_type = 2,
++                wrapper_type = (1 << BIT_wrapper_type),
++                BIT_has_full_generic_sharing_signature = 3,
++                has_full_generic_sharing_signature = (1 << BIT_has_full_generic_sharing_signature),
++                BIT_indirect_call_via_invokers = 4,
++                indirect_call_via_invokers = (1 << BIT_indirect_call_via_invokers),
++            }
++        }
++
++        internal class NativeStructWrapper : INativeMethodInfoStruct
++        {
++            public NativeStructWrapper(IntPtr ptr) => Pointer = ptr;
++
++            private static readonly int _bitfield0offset = Marshal.OffsetOf<Il2CppMethodInfo_29_0_Padded>(nameof(Il2CppMethodInfo_29_0_Padded._bitfield0)).ToInt32();
++
++            public IntPtr Pointer { get; }
++            private Il2CppMethodInfo_29_0_Padded* _ => (Il2CppMethodInfo_29_0_Padded*)Pointer;
++            public Il2CppMethodInfo* MethodInfoPointer => (Il2CppMethodInfo*)Pointer;
++            public ref IntPtr Name => ref *(IntPtr*)&_->name;
++            public ref ushort Slot => ref _->slot;
++            public ref IntPtr MethodPointer => ref *(IntPtr*)&_->methodPointer;
++            public ref IntPtr VirtualMethodPointer => ref *(IntPtr*)&_->virtualMethodPointer;
++            public ref Il2CppClass* Class => ref _->klass;
++            public ref IntPtr InvokerMethod => ref *(IntPtr*)&_->invoker_method;
++            public ref Il2CppTypeStruct* ReturnType => ref _->return_type;
++            public ref Il2CppMethodFlags Flags => ref *(Il2CppMethodFlags*)&_->flags;
++            public ref byte ParametersCount => ref _->parameters_count;
++            public ref Il2CppParameterInfo* Parameters => ref *(Il2CppParameterInfo**)&_->parameters;
++            public ref uint Token => ref _->token;
++
++            public bool IsGeneric
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_generic);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_generic, value);
++            }
++
++            public bool IsInflated
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_inflated);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_inflated, value);
++            }
++
++            public bool IsMarshalledFromNative
++            {
++                get => false;
++                set { }
++            }
++        }
++    }
++}
+diff --git a/Il2CppInterop.Runtime/Startup/Il2CppInteropRuntime.cs b/Il2CppInterop.Runtime/Startup/Il2CppInteropRuntime.cs
+index 3147986..4bdae8d 100644
+--- a/Il2CppInterop.Runtime/Startup/Il2CppInteropRuntime.cs
++++ b/Il2CppInterop.Runtime/Startup/Il2CppInteropRuntime.cs
+@@ -1,9 +1,11 @@
+ ﻿using System;
++using Il2CppInterop.Common;
+ using Il2CppInterop.Common.Host;
+ using Il2CppInterop.Common.XrefScans;
+ using Il2CppInterop.Runtime.Injection;
+ using Il2CppInterop.Runtime.Runtime;
+ using Il2CppInterop.Runtime.XrefScans;
++using Microsoft.Extensions.Logging;
+ 
+ namespace Il2CppInterop.Runtime.Startup;
+ 
+@@ -39,7 +41,11 @@ public sealed class Il2CppInteropRuntime : BaseHost
+ 
+     public override void Start()
+     {
++        CrashGuard.Install();
++        Logger.Instance.LogInformation("[startup] Il2CppInteropRuntime.Start: recalculating handlers");
+         UnityVersionHandler.RecalculateHandlers();
++        Logger.Instance.LogInformation("[startup] handlers ready; starting host components");
+         base.Start();
++        Logger.Instance.LogInformation("[startup] Il2CppInteropRuntime.Start: complete");
+     }
+ }
