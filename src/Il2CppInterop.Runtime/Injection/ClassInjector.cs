@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -561,32 +561,6 @@ public static unsafe partial class ClassInjector
                     type, string.Join(", ", parameters.Select(p => p.ParameterType.Name)), ctor.IsPublic);
             }
 
-            // Unity's AddComponent needs to resolve a parameterless .ctor on the class it is handed,
-            // and it allocates through il2cpp. Probing both here separates "class shape is wrong"
-            // from "the caller never reached us".
-            var emptyCtor = IL2CPP.il2cpp_class_get_method_from_name(classPointer.Pointer, ".ctor", 0);
-            Logger.Instance.LogInformation("[inject] {Type} GetMethodFromName(.ctor,0) -> 0x{Method:X}",
-                type, (long)emptyCtor);
-
-            var probe = IL2CPP.il2cpp_object_new(classPointer.Pointer);
-            var probeClass = probe == IntPtr.Zero ? IntPtr.Zero : IL2CPP.il2cpp_object_get_class(probe);
-            Logger.Instance.LogInformation("[inject] {Type} il2cpp_object_new -> 0x{Object:X} class=0x{Class:X}",
-                type, (long)probe, (long)probeClass);
-
-            // Object::New rejects a class when [klass->image->assembly + 0x60] != 0 and raises an
-            // ExecutionEngineException instead of allocating. Dumping the image/assembly chain of
-            // the injected class next to a real one (MonoBehaviour) shows which word is wrong.
-            if (type.Name == "UniversalBehaviour")
-            {
-                DumpImageChain(classPointer, "injected");
-                DumpImageChain(baseClassPointer, "reference");
-
-                // UniverseLib walks every loaded assembly through GetTypes() immediately after this
-                // and the CLR aborts part way through on some setups. Probing here reproduces the
-                // same walk while the assembly set is still representative, so the abort names the
-                // assembly that caused it.
-                Runtime.TypeLoadProbe.RunOnce();
-            }
         }
         catch (Exception ex)
         {
@@ -595,60 +569,6 @@ public static unsafe partial class ClassInjector
 
         if (options.LogSuccess)
             Logger.Instance.LogInformation("Registered mono type {Type} in il2cpp domain", type);
-    }
-
-    private static unsafe void DumpImageChain(INativeClassStruct klass, string label)
-    {
-        var builder = new StringBuilder();
-        var klassPointer = (byte*)klass.ClassPointer;
-        var image = *(IntPtr*)klassPointer; // Il2CppClass.image, offset 0x00
-        builder.Append("[dump] ").Append(label)
-            .Append(" klass=0x").Append(((long)klassPointer).ToString("X"))
-            .Append(" image=0x").Append(image.ToString("X"));
-
-        if (image == IntPtr.Zero)
-        {
-            Logger.Instance.LogInformation("{Dump}", builder.ToString());
-            return;
-        }
-
-        var imagePointer = (byte*)image;
-        var assembly = *(IntPtr*)(imagePointer + 0x10); // Il2CppImage.assembly
-        builder.Append(" name=0x").Append((*(IntPtr*)imagePointer).ToString("X"))
-            .Append(" assembly=0x").Append(assembly.ToString("X"));
-
-        if (assembly != IntPtr.Zero)
-        {
-            var assemblyPointer = (byte*)assembly;
-            builder.AppendLine();
-            builder.Append("    assembly.image=0x").Append((*(IntPtr*)assemblyPointer).ToString("X"))
-                .Append(" token=0x").Append((*(uint*)(assemblyPointer + 0x08)).ToString("X"))
-                .Append(" refStart=").Append(*(int*)(assemblyPointer + 0x0C))
-                .Append(" refCount=").Append(*(int*)(assemblyPointer + 0x10));
-
-            for (var offset = 0x50; offset <= 0x78; offset += 8)
-                builder.AppendLine()
-                    .Append("    +0x").Append(offset.ToString("X")).Append(" = 0x")
-                    .Append((*(ulong*)(assemblyPointer + offset)).ToString("X16"));
-        }
-
-        Logger.Instance.LogInformation("{Dump}", builder.ToString());
-    }
-
-    private static unsafe string Describe(IntPtr exception)
-    {
-        if (exception == IntPtr.Zero) return "<none>";
-
-        try
-        {
-            var buffer = stackalloc byte[1024];
-            IL2CPP.il2cpp_format_exception(exception, buffer, 1024);
-            return System.Text.Encoding.UTF8.GetString(buffer, 1024).TrimEnd('\0');
-        }
-        catch
-        {
-            return $"0x{exception:X}";
-        }
     }
 
     private static bool IsTypeSupported(Type type)

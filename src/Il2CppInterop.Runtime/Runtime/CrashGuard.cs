@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -71,8 +71,36 @@ internal static unsafe class CrashGuard
 
             s_exceptionPath = Path.Combine(dir, "il2cppinterop.exceptions.txt");
             InstallManagedHandlers();
+            RedirectStandardError(dir);
 
             Append($"--- crash guard installed, {s_modules.Count} modules mapped ---");
+        }
+        catch
+        {
+            // Diagnostics must never take the process down on their own.
+        }
+    }
+
+
+    private const int StdErrorHandle = -12;
+
+    private static FileStream s_stderrStream; // keep alive: the handle must outlive this call
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetStdHandle(int nStdHandle, IntPtr hHandle);
+
+    /// <summary>
+    /// A CLR failfast writes its reason straight to the process stderr handle and exits, so neither
+    /// a managed handler nor a vectored handler ever sees the text - the game just disappears with
+    /// nothing in the log. Pointing STD_ERROR_HANDLE at a file makes that message readable.
+    /// </summary>
+    private static void RedirectStandardError(string dir)
+    {
+        try
+        {
+            var path = Path.Combine(dir, "il2cppinterop.stderr.txt");
+            s_stderrStream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+            SetStdHandle(StdErrorHandle, s_stderrStream.SafeFileHandle.DangerousGetHandle());
         }
         catch
         {

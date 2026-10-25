@@ -1,0 +1,42 @@
+# 放到 <Game>/MelonLoader/net6/il2cppinterop.skip.txt
+#
+# 这个文件解决 HybridCLR 游戏的致命崩溃。如果你的游戏不用 HybridCLR，可以不要它。
+#
+# ---------------------------------------------------------------------------
+# 为什么需要
+# ---------------------------------------------------------------------------
+# 不装这个 hook 时，游戏会在加载 HybridCLR 热更 DLL 的那一刻 failfast：
+#
+#   Fatal error. Invalid Program: attempted to call a UnmanagedCallersOnly method
+#   from managed code.
+#      at MetadataCache_GetTypeInfoFromTypeDefinitionIndex_Hook.Hook(IntPtr)
+#      at Class_FromIl2CppType_Hook.Hook(Il2CppType*, Boolean)
+#
+# 调用链是 managed -> native -> managed 的重入：
+#
+#   managed   Class_FromIl2CppType_Hook.Hook
+#               └─ Original(type, throwOnError)          回到原生蹦床
+#   native    Class::FromIl2CppType
+#               └─ 内部调用 MetadataCache::GetTypeInfoFromTypeDefinitionIndex
+#                                                         这个地址已被打 detour
+#   managed   MetadataCache_GetTypeInfoFromTypeDefinitionIndex_Hook.Hook
+#
+# JIT 在编译第二层托管 hook 时判定其中有一次调用目标是 [UnmanagedCallersOnly]
+# 方法，直接 failfast。detour provider 由 MelonLoader 提供，插件侧改不了它，
+# 只能避开这条重入路径。
+#
+# 为什么不开服务端就没事：不开服务端根本不会走到热更 DLL 加载，
+# 也就不会命中这条重入。
+#
+# ---------------------------------------------------------------------------
+# 关掉它会影响功能吗
+# ---------------------------------------------------------------------------
+# 不会。这个 hook 唯一的用途是「用 typeDefinitionIndex 查注入类」，而注入类的
+# token 是负数（byval_arg.data = -token），实际走的是 Class::FromIl2CppType
+# 那个 hook。所以不装它，注入类型照样能解析，UnityExplorer 正常工作。
+#
+# 注意：不要把 `hooks` 全部跳过。那样连 Class::FromIl2CppType 也没了，
+# 注入类型会彻底无法解析，反而在 [-4+8] 上直接 AV。
+# ---------------------------------------------------------------------------
+
+metadata

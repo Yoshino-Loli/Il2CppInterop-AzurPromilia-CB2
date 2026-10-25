@@ -74,6 +74,11 @@ namespace Il2CppInterop.Runtime.Injection
 
             InjectedAssembly.Name.Name = Marshal.StringToCoTaskMemUTF8("InjectedMonoTypes");
 
+            // A real Il2CppAssembly always points back at its image; this one used to be left NULL.
+            // Anything that walks the assembly -> image chain (HybridCLR registering hotfix metadata,
+            // for one) dereferences it, so keep the two structures mutually consistent.
+            InjectedAssembly.Image = InjectedImage.ImagePointer;
+
             InjectedImage.Assembly = InjectedAssembly.AssemblyPointer;
             InjectedImage.Dynamic = 1;
             InjectedImage.Name = InjectedAssembly.Name.Name;
